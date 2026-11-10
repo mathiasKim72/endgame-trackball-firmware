@@ -76,7 +76,7 @@ jobs:
           for option in ('CONFIG_BOARD_EFOGTECH_TRBL_52833=y','CONFIG_ZMK_USB=y','CONFIG_ZMK_BLE=y','CONFIG_ZMK_POINTING=y'):
            assert option in config, option
           dts=(out/'zephyr.dts').read_text(); layer=dts.split('default_layer {',1)[1].split('};',1)[0]
-          bindings=re.search(r'bindings\s*=\s*(.*?);',layer,re.S).group(1)
+          bindings=re.search(r'(?<![\w-])bindings\s*=\s*(.*?);',layer,re.S).group(1)
           tokens=re.findall(r'&\w+|0x[0-9a-fA-F]+|\d+',bindings)
           if '&mkp' in tokens:
            mouse_id='&mkp'
