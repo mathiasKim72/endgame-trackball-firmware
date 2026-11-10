@@ -1,0 +1,89 @@
+name: Endgame body eight HID buttons
+on:
+  push:
+    branches: [endgame-body-hid-8buttons]
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  build-body:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: Fetch pinned public modules over HTTPS
+        run: |
+          git config --global url.https://github.com/.insteadOf git@github.com:
+          git submodule update --init $(git config --file .gitmodules --get-regexp path | awk '{print $2}' | grep -v '^endgame-trackball-bootloader$')
+      - name: Adapt pinned ZMK and body keymap
+        shell: python
+        run: |
+          from pathlib import Path
+          import subprocess
+          assert subprocess.check_output(['git','-C','zmk','rev-parse','HEAD'],text=True).strip()=='a3f7e5c767204b92eaaead3b8ebe0c29bc188dc0'
+          assert subprocess.check_output(['git','-C','endgame-trackball-config','rev-parse','HEAD'],text=True).strip()=='a689fe7e68fd3d4cd775bee8ac24146d9eccc3ed'
+          def change(path,old,new):
+           p=Path(path); s=p.read_text(); assert s.count(old)==1,(path,old); p.write_text(s.replace(old,new))
+          change('zmk/app/include/dt-bindings/zmk/pointing.h','#define MB5 BIT(4)','#define MB5 BIT(4)\n#define MB6 BIT(5)\n#define MB7 BIT(6)\n#define MB8 BIT(7)')
+          change('zmk/app/include/zmk/hid.h','#define ZMK_HID_MOUSE_NUM_BUTTONS 0x05','#define ZMK_HID_MOUSE_NUM_BUTTONS 0x08')
+          change('zmk/app/include/zmk/hid.h','''    HID_REPORT_COUNT(0x5),
+              HID_INPUT(ZMK_HID_MAIN_VAL_DATA | ZMK_HID_MAIN_VAL_VAR | ZMK_HID_MAIN_VAL_ABS),
+              // Constant padding for the last 3 bits.
+              HID_REPORT_SIZE(0x03),
+              HID_REPORT_COUNT(0x01),
+              HID_INPUT(ZMK_HID_MAIN_VAL_CONST | ZMK_HID_MAIN_VAL_VAR | ZMK_HID_MAIN_VAL_ABS),''','''    HID_REPORT_COUNT(ZMK_HID_MOUSE_NUM_BUTTONS),
+              HID_INPUT(ZMK_HID_MAIN_VAL_DATA | ZMK_HID_MAIN_VAL_VAR | ZMK_HID_MAIN_VAL_ABS),''')
+          change('zmk/app/src/hid.c','static int explicit_button_counts[5] = {0, 0, 0, 0, 0};','static int explicit_button_counts[ZMK_HID_MOUSE_NUM_BUTTONS] = {0};')
+          change('zmk/app/src/pointing/input_listener.c','    case INPUT_BTN_4:','    case INPUT_BTN_4:\n    case INPUT_BTN_5:\n    case INPUT_BTN_6:\n    case INPUT_BTN_7:')
+          change('zmk/app/src/behaviors/behavior_mouse_key_press.c','    {.display_name = "MB5", .type = BEHAVIOR_PARAMETER_VALUE_TYPE_VALUE, .value = MB5}};','\n'.join('    {.display_name = "MB%d", .type = BEHAVIOR_PARAMETER_VALUE_TYPE_VALUE, .value = MB%d}%s'%(i,i,',' if i<8 else '};') for i in range(5,9)))
+          p=Path('endgame-trackball-config/config/efogtech_trackball_0.keymap'); s=p.read_text(); start=s.index('    // buttons'); end=s.index('    // rotary encoders',start)
+          s=s[:start]+'''    // Eight independent physical mouse buttons (USB/Bluetooth).
+                          &mkp MB6  &mkp MB7
+                          &mkp MB3  &mkp MB8
+                          &mkp MB1  &mkp MB2
+                          &mkp MB4  &mkp MB5
+          
+                      '''+s[end:]; p.write_text(s)
+          print('Applied pinned-source eight-button patch.')
+      - name: Build only Endgame body
+        run: |
+          mkdir -p output
+          docker build -t endgame-body-8buttons .
+          docker run --rm -v "$PWD:/workspace" -v "$PWD/output:/output" endgame-body-8buttons
+      - name: Validate compiled body UF2 and HID report
+        shell: python
+        run: |
+          from pathlib import Path
+          import struct, hashlib, re
+          out=Path('zmk/build/zephyr'); uf2=(out/'zmk.uf2').read_bytes(); binary=(out/'zmk.bin').read_bytes()
+          assert len(uf2)>0 and len(uf2)%512==0
+          payload={}; total=len(uf2)//512
+          for i in range(total):
+           b=uf2[i*512:(i+1)*512]; m0,m1,flags,addr,size,num,nblocks,family=struct.unpack_from('<8I',b)
+           assert (m0,m1)==(0x0A324655,0x9E5D5157) and struct.unpack_from('<I',b,508)[0]==0x0AB16F30
+           assert num==i and nblocks==total and size==256 and flags&0x2000 and family==0x621E937A
+           assert 0x1000<=addr and addr+size<=0x6c000
+           assert addr not in payload; payload[addr]=b[32:32+size]
+          image=b''.join(payload[a] for a in sorted(payload))
+          assert min(payload)==0x1000 and sorted(payload)==list(range(0x1000,0x1000+256*total,256))
+          assert image[:len(binary)]==binary
+          expected=bytes.fromhex('05 09 19 01 29 08 15 00 25 01 75 01 95 08 81 02')
+          assert expected in binary, '8-button HID descriptor missing from compiled image'
+          assert bytes.fromhex('05 09 19 01 29 05 15 00 25 01 75 01 95 05 81 02') not in binary
+          config=(out/'.config').read_text()
+          for option in ('CONFIG_BOARD_EFOGTECH_TRBL_52833=y','CONFIG_ZMK_USB=y','CONFIG_ZMK_BLE=y','CONFIG_ZMK_POINTING=y'):
+           assert option in config, option
+          dts=(out/'zephyr.dts').read_text(); layer=dts.split('default_layer {',1)[1].split('};',1)[0]
+          assert len(re.findall(r'&mkp\s',layer))==8
+          for mask in (1,2,4,8,16,32,64,128):
+           assert re.search(r'&mkp\s+(?:0x0*'+format(mask,'x')+r'|'+str(mask)+r')\b',layer),mask
+          print('PASS: body target, USB/BLE, eight compiled button bindings, 8-bit HID descriptor, UF2 family/address range and binary payload.')
+          print('SHA256',hashlib.sha256(uf2).hexdigest())
+      - name: Upload validated body firmware
+        uses: actions/upload-artifact@v4
+        with:
+          name: endgame-body-8buttons-validated
+          path: output/zmk.uf2
+          if-no-files-found: error
