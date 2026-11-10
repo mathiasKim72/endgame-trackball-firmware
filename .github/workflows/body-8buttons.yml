@@ -16,7 +16,7 @@ jobs:
       - name: Fetch pinned public modules over HTTPS
         run: |
           git config --global url.https://github.com/.insteadOf git@github.com:
-          git submodule update --init $(git config --file .gitmodules --get-regexp path | awk '{print $2}' | grep -v '^endgame-trackball-bootloader$')
+          git submodule update --init $(git ls-tree HEAD | awk '$1 == "160000" {print $4}' | grep -v '^endgame-trackball-bootloader$')
       - name: Adapt pinned ZMK and body keymap
         shell: python
         run: |
