@@ -1,12 +1,12 @@
-name: Endgame body eight HID buttons
+name: Endgame body and dongle eight HID buttons
 on:
   push:
-    branches: [endgame-body-hid-8buttons]
+    branches: [endgame-usb-ble-dongle-8buttons]
   workflow_dispatch:
 permissions:
   contents: read
 jobs:
-  build-body:
+  build-body-and-dongle:
     runs-on: ubuntu-24.04
     timeout-minutes: 60
     steps:
@@ -47,7 +47,90 @@ jobs:
           
                       '''+s[end:]; p.write_text(s)
           print('Applied pinned-source eight-button patch.')
-      - name: Build only Endgame body
+      - name: Enable eight-button ESB forwarding and dongle HID
+        shell: python
+        run: |
+          from pathlib import Path
+          import subprocess
+          assert subprocess.check_output(['git','-C','zmk-esb-endpoint','rev-parse','HEAD'],text=True).strip()=='d482f54894943759003b04500ee825e11cf52dc3'
+          def change(path,old,new):
+           p=Path(path);s=p.read_text();assert s.count(old)==1,(path,old);p.write_text(s.replace(old,new))
+          change('zmk-esb-endpoint/src/esb/input_processor_esb.c','event->code <= INPUT_BTN_4','event->code <= INPUT_BTN_7')
+          change('dongle-1k-firmware/src/usb_hid.c', '''            HID_REPORT_SIZE(1),
+                      HID_REPORT_COUNT(8 - CONFIG_DONGLE_MOUSE_BUTTON_COUNT),
+                      HID_INPUT(0x01),    /* Const pad */''', '''#if CONFIG_DONGLE_MOUSE_BUTTON_COUNT < 8
+                      HID_REPORT_SIZE(1),
+                      HID_REPORT_COUNT(8 - CONFIG_DONGLE_MOUSE_BUTTON_COUNT),
+                      HID_INPUT(0x01),    /* Const pad */
+          #endif''')
+          p=Path('dongle-1k-firmware/prj.conf');s=p.read_text();assert 'CONFIG_DONGLE_MOUSE_BUTTON_COUNT=' not in s;p.write_text(s+'\nCONFIG_DONGLE_MOUSE_BUTTON_COUNT=8\n')
+          print('Applied ESB eight-button forwarding and dongle eight-bit HID descriptor.')
+      - name: Test actual ESB handler and packet serializer
+        shell: python
+        run: |
+          from pathlib import Path
+          import subprocess, tempfile
+          source=Path('zmk-esb-endpoint/src/esb/input_processor_esb.c').read_text()
+          raw=source[source.index('static int send_hid_report_raw'):source.index('/* Caller must hold')]
+          handler=source[source.index('static int esb_ip_handle_event'):source.index('static const struct zmk_input_processor_driver_api')]
+          hid=Path('zmk/app/include/zmk/hid.h').read_text();body=hid[hid.index('struct zmk_hid_mouse_report_body {'):hid.index('#if IS_ENABLED(CONFIG_ZMK_POINTING_SMOOTH_SCROLLING)',hid.index('struct zmk_hid_mouse_report_body {'))];body=body.split('struct zmk_hid_mouse_report {')[0]
+          prefix=r'''
+          #include <stdint.h>
+          #include <stdbool.h>
+          #include <string.h>
+          #include <assert.h>
+          #include <limits.h>
+          #define __packed __attribute__((packed))
+          #define BIT(n) (1U << (n))
+          #define CLAMP(v,l,h) ((v)<(l)?(l):((v)>(h)?(h):(v)))
+          #define CONFIG_ESB_MAX_PAYLOAD_LENGTH 32
+          #define ZMK_INPUT_PROC_CONTINUE 0
+          #define ZMK_INPUT_PROC_STOP 1
+          #define INPUT_EV_REL 2
+          #define INPUT_EV_KEY 1
+          #define INPUT_REL_X 0
+          #define INPUT_REL_Y 1
+          #define INPUT_REL_WHEEL 8
+          #define INPUT_REL_HWHEEL 6
+          #define INPUT_BTN_0 0x100
+          #define INPUT_BTN_7 0x107
+          #include <zmk_esb/protocol.h>
+          typedef uint8_t zmk_mouse_button_flags_t;
+          struct input_event {int type,code,value; bool sync;};
+          struct zmk_input_processor_state {int unused;};
+          struct esb_ip_data {int32_t dx,dy,scroll_x,scroll_y;uint8_t buttons;uint32_t accum_start_ms;};
+          struct device {void *data;};
+          static bool active=true,connected=true;
+          static unsigned sends;
+          static uint8_t packet[32];
+          static bool zmk_esb_endpoint_is_active(void){return active;}
+          static bool pairing_is_connected(void){return connected;}
+          static uint32_t k_uptime_get_32(void){return 7;}
+          static int esb_transport_send(int pipe,uint8_t *data,int len){assert(pipe==ESB_PIPE_DATA);assert(len==32);memcpy(packet,data,len);sends++;return 0;}
+          '''
+          stub=r'''
+          static void send_mouse_report(struct esb_ip_data *d,bool changed){(void)changed;assert(send_hid_report_raw(d->buttons,d->dx,d->dy,d->scroll_x,d->scroll_y)==0);}
+          '''
+          main=r'''
+          int main(void){
+           _Static_assert(sizeof(struct zmk_hid_mouse_report_body)==9,"mouse body changed");
+           struct esb_ip_data d={0};struct device dev={&d};struct input_event e={INPUT_EV_KEY,INPUT_BTN_0,1,true};
+           active=false;assert(esb_ip_handle_event(&dev,&e,0,0,0)==ZMK_INPUT_PROC_CONTINUE);assert(sends==0);
+           active=true;connected=false;assert(esb_ip_handle_event(&dev,&e,0,0,0)==ZMK_INPUT_PROC_CONTINUE);assert(sends==0);connected=true;
+           for(unsigned mask=0;mask<256;mask++){
+            for(unsigned i=0;i<8;i++){e.code=INPUT_BTN_0+i;e.value=!!(mask&BIT(i));assert(esb_ip_handle_event(&dev,&e,0,0,0)==ZMK_INPUT_PROC_STOP);}
+            assert(d.buttons==mask);assert(packet[0]==ESB_PKT_HID_REPORT);assert(packet[1]==ESB_REPORT_MOUSE);assert(packet[2]==mask);
+           }
+           for(unsigned i=0;i<8;i++){e.code=INPUT_BTN_0+i;e.value=0;esb_ip_handle_event(&dev,&e,0,0,0);assert(!(packet[2]&BIT(i)));}
+           e.code=INPUT_BTN_7+1;e.value=1;esb_ip_handle_event(&dev,&e,0,0,0);assert(d.buttons==0);
+           send_hid_report_raw(255,40000,-40000,40000,-40000);struct zmk_hid_mouse_report_body b;memcpy(&b,packet+2,sizeof(b));assert(b.buttons==255);assert(b.d_x==INT16_MAX&&b.d_y==INT16_MIN&&b.d_scroll_x==INT16_MAX&&b.d_scroll_y==INT16_MIN);
+          }
+          '''
+          with tempfile.TemporaryDirectory() as temp:
+           p=Path(temp)/'esb_test.c';p.write_text(prefix+body+raw+stub+handler+main)
+           exe=Path(temp)/'esb_test';subprocess.run(['cc','-std=c11','-fsanitize=address,undefined','-I'+str(Path('zmk-esb-endpoint/include').resolve()),str(p),'-o',str(exe)],check=True);subprocess.run([str(exe)],check=True)
+          print('PASS: actual ESB input handler and packet serializer: all 256 button masks, press/release, inactive USB/BLE passthrough, motion packing.')
+      - name: Build Endgame body
         run: |
           mkdir -p output
           docker build -t endgame-body-8buttons .
@@ -89,9 +172,40 @@ jobs:
            assert int(tokens[2*i+1],0)==mask, (i,tokens)
           print('PASS: body target, USB/BLE, eight compiled button bindings, 8-bit HID descriptor, UF2 family/address range and binary payload.')
           print('SHA256',hashlib.sha256(uf2).hexdigest())
-      - name: Upload validated body firmware
+      - name: Build EFOG Dongle 1k nRF52833
+        run: |
+          docker run --rm --entrypoint /bin/bash -v "$PWD:/workspace" endgame-body-8buttons -lc 'set -euo pipefail; cd /workspace/zmk; west zephyr-export; west build --pristine always -d build-dongle -s ../dongle-1k-firmware -b efogtech_dongle_1k -- -DZEPHYR_EXTRA_MODULES=/workspace/endgame-trackball-config'
+      - name: Validate compiled dongle UF2 and eight-bit HID
+        shell: python
+        run: |
+          from pathlib import Path
+          import struct,hashlib
+          out=Path('zmk/build-dongle/zephyr');uf2=(out/'zephyr.uf2').read_bytes();binary=(out/'zephyr.bin').read_bytes();config=(out/'.config').read_text()
+          for option in ('CONFIG_BOARD_EFOGTECH_DONGLE_1K=y','CONFIG_SOC_NRF52833_QIAA=y','CONFIG_DONGLE_MOUSE_BUTTON_COUNT=8','CONFIG_DONGLE_HID_REPORT_ID_MOUSE=3'):
+           assert option in config,option
+          assert len(uf2)>0 and len(uf2)%512==0
+          payload={};total=len(uf2)//512
+          for i in range(total):
+           b=uf2[i*512:(i+1)*512];m0,m1,flags,addr,size,num,nblocks,family=struct.unpack_from('<8I',b)
+           assert (m0,m1)==(0x0A324655,0x9E5D5157) and struct.unpack_from('<I',b,508)[0]==0x0AB16F30
+           assert num==i and nblocks==total and size==256 and flags&0x2000 and family==0x621E937A
+           assert 0x1000<=addr and addr+size<=0x6c000 and addr not in payload
+           payload[addr]=b[32:32+size]
+          image=b''.join(payload[a] for a in sorted(payload))
+          assert sorted(payload)==list(range(0x1000,0x1000+256*total,256))
+          assert image[:len(binary)]==binary
+          # Eight data bits immediately followed by X/Y usages, with no padding item.
+          expected=bytes.fromhex('05 09 19 01 29 08 15 00 25 01 75 01 95 08 81 02 05 01 09 30')
+          assert expected in binary,'compiled dongle descriptor does not expose eight buttons without padding'
+          assert bytes.fromhex('05 09 19 01 29 05 15 00 25 01 75 01 95 05 81 02') not in binary
+          p=Path('output/dongle-1k-8buttons.uf2');p.write_bytes(uf2)
+          p=Path('output/zmk.uf2');p.rename('output/endgame-body-8buttons-dongle.uf2')
+          for p in sorted(Path('output').glob('*.uf2')):
+           print('VALIDATED',p.name,'SHA256',hashlib.sha256(p.read_bytes()).hexdigest())
+          print('PASS: EFOG Dongle 1k/nRF52833, eight-bit HID descriptor, no padding, UF2 family/application addresses and binary payload.')
+      - name: Upload validated body and dongle firmware
         uses: actions/upload-artifact@v4
         with:
-          name: endgame-body-8buttons-validated
-          path: output/zmk.uf2
+          name: endgame-body-and-dongle-8buttons-validated
+          path: output/*.uf2
           if-no-files-found: error
