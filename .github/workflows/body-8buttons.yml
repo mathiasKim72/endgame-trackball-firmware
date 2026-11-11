@@ -1,7 +1,7 @@
-name: Endgame body and dongle eight HID buttons
+name: Endgame eight buttons and dual standard wheels
 on:
   push:
-    branches: [endgame-usb-ble-dongle-8buttons]
+    branches: [endgame-8buttons-dual-wheel-scroll]
   workflow_dispatch:
 permissions:
   contents: read
@@ -130,6 +130,76 @@ jobs:
            p=Path(temp)/'esb_test.c';p.write_text(prefix+body+raw+stub+handler+main)
            exe=Path(temp)/'esb_test';subprocess.run(['cc','-std=c11','-fsanitize=address,undefined','-I'+str(Path('zmk-esb-endpoint/include').resolve()),str(p),'-o',str(exe)],check=True);subprocess.run([str(exe)],check=True)
           print('PASS: actual ESB input handler and packet serializer: all 256 button masks, press/release, inactive USB/BLE passthrough, motion packing.')
+      - name: Configure left vertical and right horizontal wheel impulses
+        shell: python
+        run: |
+          from pathlib import Path
+          import subprocess
+          assert subprocess.check_output(['git','-C','zmk','rev-parse','HEAD'],text=True).strip()=='a3f7e5c767204b92eaaead3b8ebe0c29bc188dc0'
+          Path('zmk/app/src/behaviors/behavior_endgame_wheel.c').write_text('/* SPDX-License-Identifier: MIT */\n#define DT_DRV_COMPAT zmk_behavior_endgame_wheel\n#include <zephyr/device.h>\n#include <zephyr/input/input.h>\n#include <drivers/behavior.h>\n#include <zmk/behavior.h>\n#include <dt-bindings/zmk/pointing.h>\n#include <errno.h>\n#if IS_ENABLED(CONFIG_ZMK_POINTING_SMOOTH_SCROLLING)\n#include <zmk/pointing/resolution_multipliers.h>\n#endif\n#if IS_ENABLED(CONFIG_ZMK_ESB_ENDPOINT)\n#include <zmk_esb/endpoint.h>\n#endif\n\n#if DT_HAS_COMPAT_STATUS_OKAY(DT_DRV_COMPAT)\n/* A detent emits one relative wheel impulse. Releasing never starts a timer. */\nstatic int wheel_pressed(struct zmk_behavior_binding *binding,\n                         struct zmk_behavior_binding_event event) {\n    const int16_t x = MOVE_X_DECODE(binding->param1);\n    const int16_t y = MOVE_Y_DECODE(binding->param1);\n    if (!((x == 0 && (y == -1 || y == 1)) ||\n          (y == 0 && (x == -1 || x == 1)))) {\n        return -EINVAL;\n    }\n    const struct device *dev = zmk_behavior_get_binding(binding->behavior_dev);\n    if (!dev) {\n        return -ENODEV;\n    }\n    int multiplier = 1;\n#if IS_ENABLED(CONFIG_ZMK_POINTING_SMOOTH_SCROLLING)\n#if IS_ENABLED(CONFIG_ZMK_ESB_ENDPOINT)\n    if (zmk_esb_endpoint_is_active()) {\n        /* ESB\'s existing wire format uses fixed 16x high-resolution scroll. */\n        multiplier = 16;\n    } else\n#endif\n    {\n        const struct zmk_pointing_resolution_multipliers m =\n            zmk_pointing_resolution_multipliers_get_current_profile();\n        multiplier = 1 + (x ? m.hor_wheel : m.wheel);\n    }\n#endif\n    return input_report_rel(dev, x ? INPUT_REL_HWHEEL : INPUT_REL_WHEEL,\n                            (x ? x : y) * multiplier, true, K_FOREVER);\n}\n\nstatic int wheel_released(struct zmk_behavior_binding *binding,\n                          struct zmk_behavior_binding_event event) {\n    return 0;\n}\n\n#if IS_ENABLED(CONFIG_ZMK_BEHAVIOR_METADATA)\nstatic const struct behavior_parameter_value_metadata wheel_values[] = {\n    {.display_name = "Scroll up", .type = BEHAVIOR_PARAMETER_VALUE_TYPE_VALUE,\n     .value = MOVE_Y(1)},\n    {.display_name = "Scroll down", .type = BEHAVIOR_PARAMETER_VALUE_TYPE_VALUE,\n     .value = MOVE_Y(-1)},\n    {.display_name = "Scroll right", .type = BEHAVIOR_PARAMETER_VALUE_TYPE_VALUE,\n     .value = MOVE_X(1U)},\n    {.display_name = "Scroll left", .type = BEHAVIOR_PARAMETER_VALUE_TYPE_VALUE,\n     .value = MOVE_X(0xFFFFU)},\n};\nstatic const struct behavior_parameter_metadata_set wheel_sets[] = {{\n    .param1_values = wheel_values, .param1_values_len = ARRAY_SIZE(wheel_values),\n}};\nstatic const struct behavior_parameter_metadata wheel_metadata = {\n    .sets_len = ARRAY_SIZE(wheel_sets), .sets = wheel_sets,\n};\n#endif\nstatic const struct behavior_driver_api wheel_api = {\n    .binding_pressed = wheel_pressed,\n    .binding_released = wheel_released,\n#if IS_ENABLED(CONFIG_ZMK_BEHAVIOR_METADATA)\n    .parameter_metadata = &wheel_metadata,\n#endif\n};\n#define WHEEL_INST(n) \\\n    BEHAVIOR_DT_INST_DEFINE(n, NULL, NULL, NULL, NULL, POST_KERNEL, \\\n                           CONFIG_KERNEL_INIT_PRIORITY_DEFAULT, &wheel_api);\nDT_INST_FOREACH_STATUS_OKAY(WHEEL_INST)\n#endif\n')
+          Path('endgame-trackball-config/config/endgame_wheel_step.dtsi').write_text('/ {\n    behaviors {\n        endgame_wheel_step: endgame_wheel_step {\n            compatible = "zmk,behavior-endgame-wheel";\n            #binding-cells = <1>;\n            display-name = "Mouse wheel (one detent)";\n        };\n    };\n    endgame_wheel_listener: endgame_wheel_listener {\n        compatible = "zmk,input-listener";\n        device = <&endgame_wheel_step>;\n        input-processors = <&esb_ip>;\n    };\n};\n')
+          Path('zmk/app/dts/bindings/behaviors/zmk,behavior-endgame-wheel.yaml').write_text('description: One standard mouse wheel detent\ncompatible: "zmk,behavior-endgame-wheel"\ninclude: one_param.yaml\n')
+          p=Path('zmk/app/CMakeLists.txt');p.write_text(p.read_text()+'\ntarget_sources(app PRIVATE src/behaviors/behavior_endgame_wheel.c)\n')
+          p=Path('endgame-trackball-config/config/efogtech_trackball_0.keymap');s=p.read_text();s='#include "endgame_wheel_step.dtsi"\n'+s
+          start=s.index('default_layer {');end=s.index('\n\t\t};',start);section=s[start:end]
+          old='&kp C_VOL_UP              &kp LC(TAB)\n\t\t\t    &kp C_VOL_DN              &kp LC(LS(TAB))'
+          new='&endgame_wheel_step MOVE_Y(1)   &endgame_wheel_step MOVE_X(1)\n                &endgame_wheel_step MOVE_Y(-1)  &endgame_wheel_step MOVE_X(-1)'
+          assert section.count(old)==1;section=section.replace(old,new);s=s[:start]+section+s[end:];p.write_text(s)
+          print('Applied discrete vertical left wheel and horizontal right wheel; eight mouse buttons unchanged.')
+      - name: Test discrete wheel events and ESB packet axes
+        shell: python
+        run: |
+          from pathlib import Path
+          Path("wheel_esb_base_test.py").write_text('from pathlib import Path\nimport subprocess, tempfile\nsource=Path(\'zmk-esb-endpoint/src/esb/input_processor_esb.c\').read_text()\nraw=source[source.index(\'static int send_hid_report_raw\'):source.index(\'/* Caller must hold\')]\nhandler=source[source.index(\'static int esb_ip_handle_event\'):source.index(\'static const struct zmk_input_processor_driver_api\')]\nhid=Path(\'zmk/app/include/zmk/hid.h\').read_text();body=hid[hid.index(\'struct zmk_hid_mouse_report_body {\'):hid.index(\'#if IS_ENABLED(CONFIG_ZMK_POINTING_SMOOTH_SCROLLING)\',hid.index(\'struct zmk_hid_mouse_report_body {\'))];body=body.split(\'struct zmk_hid_mouse_report {\')[0]\nprefix=r\'\'\'\n#include <stdint.h>\n#include <stdbool.h>\n#include <string.h>\n#include <assert.h>\n#include <limits.h>\n#define __packed __attribute__((packed))\n#define BIT(n) (1U << (n))\n#define CLAMP(v,l,h) ((v)<(l)?(l):((v)>(h)?(h):(v)))\n#define CONFIG_ESB_MAX_PAYLOAD_LENGTH 32\n#define ZMK_INPUT_PROC_CONTINUE 0\n#define ZMK_INPUT_PROC_STOP 1\n#define INPUT_EV_REL 2\n#define INPUT_EV_KEY 1\n#define INPUT_REL_X 0\n#define INPUT_REL_Y 1\n#define INPUT_REL_WHEEL 8\n#define INPUT_REL_HWHEEL 6\n#define INPUT_BTN_0 0x100\n#define INPUT_BTN_7 0x107\n#include <zmk_esb/protocol.h>\ntypedef uint8_t zmk_mouse_button_flags_t;\nstruct input_event {int type,code,value; bool sync;};\nstruct zmk_input_processor_state {int unused;};\nstruct esb_ip_data {int32_t dx,dy,scroll_x,scroll_y;uint8_t buttons;uint32_t accum_start_ms;};\nstruct device {void *data;};\nstatic bool active=true,connected=true;\nstatic unsigned sends;\nstatic uint8_t packet[32];\nstatic bool zmk_esb_endpoint_is_active(void){return active;}\nstatic bool pairing_is_connected(void){return connected;}\nstatic uint32_t k_uptime_get_32(void){return 7;}\nstatic int esb_transport_send(int pipe,uint8_t *data,int len){assert(pipe==ESB_PIPE_DATA);assert(len==32);memcpy(packet,data,len);sends++;return 0;}\n\'\'\'\nstub=r\'\'\'\nstatic void send_mouse_report(struct esb_ip_data *d,bool changed){(void)changed;assert(send_hid_report_raw(d->buttons,d->dx,d->dy,d->scroll_x,d->scroll_y)==0);}\n\'\'\'\nmain=r\'\'\'\nint main(void){\n _Static_assert(sizeof(struct zmk_hid_mouse_report_body)==9,"mouse body changed");\n struct esb_ip_data d={0};struct device dev={&d};struct input_event e={INPUT_EV_KEY,INPUT_BTN_0,1,true};\n active=false;assert(esb_ip_handle_event(&dev,&e,0,0,0)==ZMK_INPUT_PROC_CONTINUE);assert(sends==0);\n active=true;connected=false;assert(esb_ip_handle_event(&dev,&e,0,0,0)==ZMK_INPUT_PROC_CONTINUE);assert(sends==0);connected=true;\n for(unsigned mask=0;mask<256;mask++){\n  for(unsigned i=0;i<8;i++){e.code=INPUT_BTN_0+i;e.value=!!(mask&BIT(i));assert(esb_ip_handle_event(&dev,&e,0,0,0)==ZMK_INPUT_PROC_STOP);}\n  assert(d.buttons==mask);assert(packet[0]==ESB_PKT_HID_REPORT);assert(packet[1]==ESB_REPORT_MOUSE);assert(packet[2]==mask);\n }\n for(unsigned i=0;i<8;i++){e.code=INPUT_BTN_0+i;e.value=0;esb_ip_handle_event(&dev,&e,0,0,0);assert(!(packet[2]&BIT(i)));}\n e.code=INPUT_BTN_7+1;e.value=1;esb_ip_handle_event(&dev,&e,0,0,0);assert(d.buttons==0);\n send_hid_report_raw(255,40000,-40000,40000,-40000);struct zmk_hid_mouse_report_body b;memcpy(&b,packet+2,sizeof(b));assert(b.buttons==255);assert(b.d_x==INT16_MAX&&b.d_y==INT16_MIN&&b.d_scroll_x==INT16_MAX&&b.d_scroll_y==INT16_MIN);\n}\n\'\'\'\nwith tempfile.TemporaryDirectory() as temp:\n p=Path(temp)/\'esb_test.c\';p.write_text(prefix+body+raw+stub+handler+main)\n exe=Path(temp)/\'esb_test\';subprocess.run([\'cc\',\'-std=c11\',\'-fsanitize=address,undefined\',\'-I\'+str(Path(\'zmk-esb-endpoint/include\').resolve()),str(p),\'-o\',str(exe)],check=True);subprocess.run([str(exe)],check=True)\nprint(\'PASS: actual ESB input handler and packet serializer: all 256 button masks, press/release, inactive USB/BLE passthrough, motion packing.\')\n')
+          from pathlib import Path
+          import subprocess,tempfile,runpy
+          base=runpy.run_path('wheel_esb_base_test.py') if Path('wheel_esb_base_test.py').exists() else runpy.run_path('../test_esb_8buttons.py')
+          source=Path('zmk/app/src/behaviors/behavior_endgame_wheel.c').read_text();callbacks=source[source.index('static int wheel_pressed'):source.index('#if IS_ENABLED(CONFIG_ZMK_BEHAVIOR_METADATA)')]
+          pointing='\n'.join(x for x in Path('zmk/app/include/dt-bindings/zmk/pointing.h').read_text().splitlines() if not x.startswith('#include') and x!='#pragma once')
+          extra=r'''
+          #include <errno.h>
+          #define IS_ENABLED(x) x
+          #define CONFIG_ZMK_POINTING_SMOOTH_SCROLLING 1
+          #define CONFIG_ZMK_ESB_ENDPOINT 1
+          #define K_FOREVER -1
+          struct zmk_behavior_binding {const char *behavior_dev;uint32_t param1,param2;};
+          struct zmk_behavior_binding_event {int unused;};
+          struct zmk_pointing_resolution_multipliers {uint8_t wheel,hor_wheel;};
+          static struct zmk_pointing_resolution_multipliers multipliers={15,15};
+          static struct zmk_pointing_resolution_multipliers zmk_pointing_resolution_multipliers_get_current_profile(void){return multipliers;}
+          static struct esb_ip_data wheel_data;
+          static const struct device wheel_dev={&wheel_data};
+          static const struct device *zmk_behavior_get_binding(const char *s){return s?&wheel_dev:0;}
+          static unsigned wheel_events;static int last_code,last_value;
+          static int input_report_rel(const struct device *dev,int code,int value,bool sync,int timeout){
+           (void)timeout;wheel_events++;last_code=code;last_value=value;
+           struct input_event e={INPUT_EV_REL,code,value,sync};
+           return esb_ip_handle_event(dev,&e,0,0,0)==ZMK_INPUT_PROC_STOP?0:0;
+          }
+          '''
+          main=r'''
+          int main(void){
+           const uint32_t directions[]={MOVE_Y(1),MOVE_Y(-1),MOVE_X(1U),MOVE_X(0xFFFFU)};
+           const int codes[]={INPUT_REL_WHEEL,INPUT_REL_WHEEL,INPUT_REL_HWHEEL,INPUT_REL_HWHEEL};
+           const int signs[]={1,-1,1,-1};
+           struct zmk_behavior_binding b={"endgame_wheel_step",0,0};struct zmk_behavior_binding_event e={0};
+           for(int factor=1;factor<=16;factor++){
+            active=false;multipliers.wheel=factor-1;multipliers.hor_wheel=factor-1;
+            for(int i=0;i<4;i++){b.param1=directions[i];unsigned before=wheel_events;assert(wheel_pressed(&b,e)==0);assert(wheel_events==before+1);assert(last_code==codes[i]&&last_value==signs[i]*factor);assert(wheel_released(&b,e)==0&&wheel_events==before+1);}
+           }
+           active=true;connected=true;multipliers.wheel=0;multipliers.hor_wheel=0;
+           for(int i=0;i<4;i++){
+            memset(&wheel_data,0,sizeof(wheel_data));wheel_data.buttons=0xA5;b.param1=directions[i];assert(wheel_pressed(&b,e)==0);
+            struct zmk_hid_mouse_report_body r;memcpy(&r,packet+2,sizeof(r));assert(r.buttons==0xA5&&r.d_x==0&&r.d_y==0);
+            assert(r.d_scroll_y==(i<2?signs[i]*16:0));assert(r.d_scroll_x==(i>=2?signs[i]*16:0));
+           }
+           unsigned before=wheel_events;b.param1=0;assert(wheel_pressed(&b,e)==-EINVAL);b.param1=MOVE_X(1U)|MOVE_Y(1);assert(wheel_pressed(&b,e)==-EINVAL);assert(wheel_events==before);
+          }
+          '''
+          code=base['prefix']+base['body']+base['raw']+base['stub']+base['handler']+pointing+extra+callbacks+main
+          with tempfile.TemporaryDirectory() as tmp:
+           p=Path(tmp)/'wheel_test.c';p.write_text(code);exe=Path(tmp)/'wheel_test';subprocess.run(['cc','-std=c11','-fsanitize=address,undefined','-I'+str(Path('zmk-esb-endpoint/include').resolve()),str(p),'-o',str(exe)],check=True);subprocess.run([str(exe)],check=True)
+          print('PASS: actual wheel behavior, one impulse/no release repeat, both axes/directions, all 16 USB/BLE resolution factors and ESB packet fields; held mouse buttons preserved.')
       - name: Build Endgame body
         run: |
           mkdir -p output
@@ -172,6 +242,30 @@ jobs:
            assert int(tokens[2*i+1],0)==mask, (i,tokens)
           print('PASS: body target, USB/BLE, eight compiled button bindings, 8-bit HID descriptor, UF2 family/address range and binary payload.')
           print('SHA256',hashlib.sha256(uf2).hexdigest())
+      - name: Validate compiled physical wheel mappings and HID axes
+        shell: python
+        run: |
+          from pathlib import Path
+          import re
+          out=Path('zmk/build/zephyr');dts=(out/'zephyr.dts').read_text();layer=dts.split('default_layer {',1)[1].split('};',1)[0]
+          def tokens_for(prop,text):
+           val=re.search(r'(?<![\w-])'+prop+r'\s*=\s*(.*?);',text,re.S).group(1)
+           return re.findall(r'&\w+|0x[0-9a-fA-F]+|\d+',val)
+          t=tokens_for('bindings',layer)
+          assert len(t)==24,t
+          assert all(t[i]=='&endgame_wheel_step' for i in (16,18,20,22)),t
+          assert [int(t[i],0) for i in (17,19,21,23)]==[1,65536,65535,4294901760],t
+          sensor=tokens_for('sensor-bindings',layer)
+          assert sensor==['&rotenc_follower','0xa','0x8','&rotenc_follower','0x9','0xb'],sensor
+          node=re.search(r'endgame_wheel_listener\s*\{(.*?)\};',dts,re.S).group(1)
+          assert tokens_for('device',node)==['&endgame_wheel_step']
+          assert tokens_for('input-processors',node)==['&esb_ip']
+          node=re.search(r'sensors: sensors\s*\{(.*?)\};',dts,re.S).group(1)
+          assert tokens_for('sensors',node)==['&left_encoder','&right_encoder']
+          binary=(out/'zmk.bin').read_bytes();start=binary.index(bytes.fromhex('05 09 19 01 29 08 15 00 25 01 75 01 95 08 81 02'))
+          desc=binary[start:start+220]
+          assert bytes.fromhex('09 38') in desc and bytes.fromhex('05 0c 0a 38 02') in desc
+          print('PASS: compiled 8 buttons, default left encoder -> vertical wheel, right encoder -> horizontal wheel, ESB listener routing and HID Wheel/AC Pan usages.')
       - name: Build EFOG Dongle 1k nRF52833
         run: |
           docker run --rm --entrypoint /bin/bash -v "$PWD:/workspace" endgame-body-8buttons -lc 'set -euo pipefail; cd /workspace/zmk; west zephyr-export; west build --pristine always -d build-dongle -s ../dongle-1k-firmware -b efogtech_dongle_1k -- -DZEPHYR_EXTRA_MODULES=/workspace/endgame-trackball-config'
@@ -197,15 +291,17 @@ jobs:
           # Eight data bits immediately followed by X/Y usages, with no padding item.
           expected=bytes.fromhex('05 09 19 01 29 08 15 00 25 01 75 01 95 08 81 02 05 01 09 30')
           assert expected in binary,'compiled dongle descriptor does not expose eight buttons without padding'
+          desc=binary[binary.index(expected):binary.index(expected)+220]
+          assert bytes.fromhex('09 38') in desc and bytes.fromhex('05 0c 0a 38 02') in desc
           assert bytes.fromhex('05 09 19 01 29 05 15 00 25 01 75 01 95 05 81 02') not in binary
-          p=Path('output/dongle-1k-8buttons.uf2');p.write_bytes(uf2)
-          p=Path('output/zmk.uf2');p.rename('output/endgame-body-8buttons-dongle.uf2')
+          p=Path('output/dongle-1k-8buttons-wheels.uf2');p.write_bytes(uf2)
+          p=Path('output/zmk.uf2');p.rename('output/endgame-body-8buttons-wheels.uf2')
           for p in sorted(Path('output').glob('*.uf2')):
            print('VALIDATED',p.name,'SHA256',hashlib.sha256(p.read_bytes()).hexdigest())
           print('PASS: EFOG Dongle 1k/nRF52833, eight-bit HID descriptor, no padding, UF2 family/application addresses and binary payload.')
       - name: Upload validated body and dongle firmware
         uses: actions/upload-artifact@v4
         with:
-          name: endgame-body-and-dongle-8buttons-validated
+          name: endgame-8buttons-dual-wheel-validated
           path: output/*.uf2
           if-no-files-found: error
