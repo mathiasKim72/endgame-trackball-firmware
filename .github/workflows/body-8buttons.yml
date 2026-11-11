@@ -266,6 +266,114 @@ jobs:
           desc=binary[start:start+220]
           assert bytes.fromhex('09 38') in desc and bytes.fromhex('05 0c 0a 38 02') in desc
           print('PASS: compiled 8 buttons, default left encoder -> vertical wheel, right encoder -> horizontal wheel, ESB listener routing and HID Wheel/AC Pan usages.')
+      - name: Honor USB host vertical and horizontal wheel resolution
+        shell: python
+        run: |
+          from pathlib import Path
+          p=Path('dongle-1k-firmware/src/usb_hid.c');s=p.read_text()
+          s=s.replace('#include <zephyr/kernel.h>','#include <zephyr/kernel.h>\n#include <zephyr/sys/byteorder.h>',1)
+          old='static uint8_t res_feature_report[2] = { REPORT_ID_MOUSE, 0xFF };'
+          new=old+'''
+          
+          /* ESB scroll is fixed at 16 counts per detent. Honor the USB host's
+           * independently requested vertical/horizontal multiplier, retaining fractions. */
+          static int32_t wheel_fraction_y, wheel_fraction_x;
+          static int16_t wheel_scale(int16_t value, uint8_t resolution, int32_t *fraction) {
+              int32_t numerator = (int32_t)value * (1 + resolution) + *fraction;
+              int16_t result = (int16_t)(numerator / 16);
+              *fraction = numerator - (int32_t)result * 16;
+              return result;
+          }
+          static void normalize_wheel_report(uint8_t *body) {
+              const uint8_t resolution = res_feature_report[1];
+              const int16_t y = (int16_t)sys_get_le16(body + 5);
+              const int16_t x = (int16_t)sys_get_le16(body + 7);
+              sys_put_le16((uint16_t)wheel_scale(y, resolution & 0x0F, &wheel_fraction_y), body + 5);
+              sys_put_le16((uint16_t)wheel_scale(x, resolution >> 4, &wheel_fraction_x), body + 7);
+          }
+          '''
+          assert s.count(old)==1;s=s.replace(old,new)
+          start=s.index('int usb_hid_send(');prefix=s[:start];send=s[start:]
+          old='    const k_spinlock_key_t key = k_spin_lock(&tx_lock);'
+          new='''    uint8_t normalized[sizeof(((struct pending_report *)0)->data)];
+              const k_spinlock_key_t key = k_spin_lock(&tx_lock);
+              if (report_type == REPORT_ID_MOUSE && len == 9) {
+                  memcpy(normalized, data, len);
+                  normalize_wheel_report(normalized);
+                  data = normalized;
+              }'''
+          assert send.count(old)==1;s=prefix+send.replace(old,new)
+          s=s.replace('            tx_head = tx_tail = 0;','            tx_head = tx_tail = 0;\n            wheel_fraction_y = wheel_fraction_x = 0;\n            res_feature_report[1] = 0xFF;',1)
+          # Reset partial detents when the host changes the requested multiplier.
+          old='    LOG_INF("SET_REPORT feature mouse res-mult=0x%02X", res_feature_report[1]);'
+          new='''    const k_spinlock_key_t key = k_spin_lock(&tx_lock);
+              wheel_fraction_y = wheel_fraction_x = 0;
+              k_spin_unlock(&tx_lock, key);
+          '''+old
+          assert s.count(old)==1;s=s.replace(old,new)
+          s=s.replace('The keyboard runs\n * at a fixed multiplier=15 and is unaware of the dongle\'s stored value; we only\n * keep it here so GET reflects the most recent SET.', 'The keyboard runs\n * at a fixed multiplier=15; normalize_wheel_report converts that format to\n * the multiplier requested by the USB host.')
+          s=s.replace('    /* Host may or may not include the report_id prefix. Accept either. */', '    uint8_t new_resolution;\n    /* Host may or may not include the report_id prefix. Accept either. */',1)
+          s=s.replace('res_feature_report[1] = (*data)[1];','new_resolution = (*data)[1];',1).replace('res_feature_report[1] = (*data)[0];','new_resolution = (*data)[0];',1)
+          s=s.replace('    wheel_fraction_y = wheel_fraction_x = 0;\n    k_spin_unlock(&tx_lock, key);','    res_feature_report[1] = new_resolution;\n    wheel_fraction_y = wheel_fraction_x = 0;\n    k_spin_unlock(&tx_lock, key);',1)
+          p.write_text(s)
+          print('Dongle wheel reports honor both USB host resolution multipliers without dropping fractional scroll.')
+      - name: Test dongle wheel resolution and USB queue preservation
+        shell: python
+        run: |
+          from pathlib import Path
+          import subprocess,tempfile
+          s=Path('dongle-1k-firmware/src/usb_hid.c').read_text()
+          state=s[s.index('static const struct device *hdev;'):s.index('/* Resolution-multiplier feature report:')]
+          helpers=s[s.index('static uint8_t res_feature_report'):s.index('static int submit_locked')]
+          submit=s[s.index('static int submit_locked'):s.index('static int get_report_cb')]
+          send=s[s.index('int usb_hid_send('):]
+          prefix=r'''
+          #include <stdint.h>
+          #include <stdbool.h>
+          #include <string.h>
+          #include <assert.h>
+          #include <errno.h>
+          #define REPORT_ID_MOUSE 3
+          #define CONFIG_DONGLE_USB_TX_QUEUE_DEPTH 64
+          #define MIN(a,b) ((a)<(b)?(a):(b))
+          #define ARG_UNUSED(x) (void)(x)
+          #define LOG_ERR(...)
+          #define LOG_WRN(...)
+          struct device{int unused;};struct k_spinlock{int unused;};typedef int k_spinlock_key_t;
+          static int k_spin_lock(struct k_spinlock *p){(void)p;return 0;}
+          static void k_spin_unlock(struct k_spinlock *p,int k){(void)p;(void)k;}
+          static uint8_t host[33];static uint32_t host_len;
+          static int hid_int_ep_write(const struct device *d,uint8_t *buf,uint32_t len,uint32_t *wrote){(void)d;memcpy(host,buf,len);host_len=len;*wrote=len;return 0;}
+          static uint16_t sys_get_le16(const uint8_t *b){return b[0]|((uint16_t)b[1]<<8);}
+          static void sys_put_le16(uint16_t v,uint8_t *b){b[0]=v;b[1]=v>>8;}
+          '''
+          main=r'''
+          int main(void){uint8_t body[9]={0};assert(usb_hid_send(3,body,9)==-ENOTCONN);m_configured=true;
+           for(unsigned i=0;i<256;i++){
+            body[0]=i;body[1]=0x12;body[4]=0x34;
+            assert(usb_hid_send(3,body,9)==0);assert(host_len==10&&host[0]==3&&host[1]==i&&host[2]==0x12&&host[5]==0x34);
+            body[0]=0;assert(usb_hid_send(3,body,9)==0);assert(ep_busy);int_in_ready_cb(0);assert(host[1]==0);int_in_ready_cb(0);assert(!ep_busy);
+           }
+           for(unsigned y=0;y<16;y++)for(unsigned x=0;x<16;x++){
+            res_feature_report[1]=y|(x<<4);wheel_fraction_y=wheel_fraction_x=0;
+            for(int sign=-1;sign<=1;sign+=2){
+             body[0]=0xA5;sys_put_le16((uint16_t)(sign*16),body+5);sys_put_le16((uint16_t)(sign*16),body+7);
+             assert(usb_hid_send(3,body,9)==0);assert(host[1]==0xA5&&host[2]==0x12&&host[5]==0x34);
+             assert((int16_t)sys_get_le16(host+6)==sign*(int)(y+1));assert((int16_t)sys_get_le16(host+8)==sign*(int)(x+1));int_in_ready_cb(0);
+            }
+            int sum_y=0,sum_x=0;sys_put_le16(1,body+5);sys_put_le16(1,body+7);
+            for(int i=0;i<16;i++){assert(usb_hid_send(3,body,9)==0);sum_y+=(int16_t)sys_get_le16(host+6);sum_x+=(int16_t)sys_get_le16(host+8);int_in_ready_cb(0);}
+            assert(sum_y==(int)y+1&&sum_x==(int)x+1);assert(wheel_fraction_y==0&&wheel_fraction_x==0);
+            sys_put_le16((uint16_t)-1,body+5);sys_put_le16((uint16_t)-1,body+7);sum_y=sum_x=0;
+            for(int i=0;i<16;i++){assert(usb_hid_send(3,body,9)==0);sum_y+=(int16_t)sys_get_le16(host+6);sum_x+=(int16_t)sys_get_le16(host+8);int_in_ready_cb(0);}
+            assert(sum_y==-((int)y+1)&&sum_x==-((int)x+1));assert(wheel_fraction_y==0&&wheel_fraction_x==0);
+           }
+           assert(usb_hid_send(3,body,33)==-EMSGSIZE);
+          }
+          '''
+          with tempfile.TemporaryDirectory() as tmp:
+           p=Path(tmp)/'test.c';p.write_text(prefix+state+helpers+submit+send+main);exe=Path(tmp)/'test';subprocess.run(['cc','-std=c11','-fsanitize=address,undefined',str(p),'-o',str(exe)],check=True);subprocess.run([str(exe)],check=True)
+          print('PASS: actual dongle USB send/queue: 256 button masks, 256 vertical/horizontal resolution combinations, both signs and lossless fractional scrolling; buttons/X/Y preserved.')
       - name: Build EFOG Dongle 1k nRF52833
         run: |
           docker run --rm --entrypoint /bin/bash -v "$PWD:/workspace" endgame-body-8buttons -lc 'set -euo pipefail; cd /workspace/zmk; west zephyr-export; west build --pristine always -d build-dongle -s ../dongle-1k-firmware -b efogtech_dongle_1k -- -DZEPHYR_EXTRA_MODULES=/workspace/endgame-trackball-config'
